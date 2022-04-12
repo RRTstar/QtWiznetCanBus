@@ -24,6 +24,7 @@ public:
     uint8_t  canDriverRead(void);
     uint32_t canDriverWrite(uint8_t *p_data, uint32_t length);
 
+    QCanBusDevice::CanBusStatus canGetStatus();
 protected:
     bool open() override;
     void close() override;
@@ -43,6 +44,9 @@ private:
     qbuffer_t cmd_can_q;
 
     qint64 offset_time;
+    uint32_t ping_cnt;
+    bool     is_connected;
+    CanBusStatus can_bus_status;
 
 private slots:
     void dataAvailable();

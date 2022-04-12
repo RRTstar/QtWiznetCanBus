@@ -95,7 +95,7 @@ QList<QCanBusDeviceInfo> WiznetCanBackend::interfaces()
 {
     QList<QCanBusDeviceInfo> result;
     result.append(createDeviceInfo(QStringLiteral("127.0.0.1:4444")));
-    result.append(createDeviceInfo(QStringLiteral("172.30.1.54:4444")));
+    result.append(createDeviceInfo(QStringLiteral("172.30.1.51:4444")));
     result.append(createDeviceInfo(QStringLiteral("192.168.44.4:4444")));
     return result;
 }
@@ -118,6 +118,15 @@ WiznetCanBackend::WiznetCanBackend(quint16 localPort,
     qbufferCreate(&cmd_can_q, cmd_can_buf, 512*1024);
 
     offset_time = -1;
+    can_bus_status = CanBusStatus::Unknown;
+
+    std::function<CanBusStatus()> func= [&]()
+    {
+        return can_bus_status;
+    };
+
+
+    setCanBusStatusGetter(func);
 }
 
 bool WiznetCanBackend::writeFrame(const QCanBusFrame& frame)
@@ -150,9 +159,11 @@ bool WiznetCanBackend::open()
 
     qDebug() << "connect()";
 
-
+    is_connected = false;
+    can_bus_status = CanBusStatus::Unknown;
     cmdCanSendType(&cmd_can, PKT_TYPE_PING, NULL, 0);
 
+    ping_cnt = 0;
     return true;
 }
 
@@ -163,6 +174,11 @@ void WiznetCanBackend::close()
     sock_.close();
     killTimer(timerId_);
     timerId_ = 0;
+}
+
+QCanBusDevice::CanBusStatus WiznetCanBackend::canGetStatus()
+{
+    return can_bus_status;
 }
 
 void WiznetCanBackend::dataAvailable()
@@ -203,26 +219,6 @@ void WiznetCanBackend::timerEvent(QTimerEvent* ev)
     unsigned long totalBytes = 0;
     while (f.isValid() && totalBytes < MAX_BYTES_PER_TIMEOUT)
     {
-#if 0
-        auto rawFrame = convert(f);
-        std::list<canfd_frame*> frames = {&rawFrame};
-        uint8_t buf[128];
-        auto end = buildPacket(sizeof(buf), buf, frames, 0, [](auto, auto) {
-            // the packet should not overflow : the buffer is supposed to be
-            // large enough to handle stuffing a CAN frame inside it. if that's
-            // not the case, there is a bug or some other problem.
-            Q_ASSERT(0 && "buildPacket() overflow callback called");
-        });
-        sock_.writeDatagram(reinterpret_cast<char*>(buf), end - buf,
-                            remoteAddr_, remotePort_);
-
-        f = dequeueOutgoingFrame();
-        ++framesSent;
-        totalBytes += (end - buf);
-#else
-        //const char *send_str = "send can\n";
-        //sock_.writeDatagram(send_str, strlen(send_str)+1,remoteAddr_, remotePort_);
-
         can_msg_t can_msg;
 
         can_msg = convert(f);
@@ -230,7 +226,6 @@ void WiznetCanBackend::timerEvent(QTimerEvent* ev)
 
         f = dequeueOutgoingFrame();
         ++framesSent;
-#endif
     }
     if (framesSent)
     {
@@ -239,29 +234,23 @@ void WiznetCanBackend::timerEvent(QTimerEvent* ev)
         emit framesWritten(framesSent);
     }
     //qDebug() << "Wrote" << totalBytes << "bytes and" << framesSent << "frames";
+
+    ping_cnt++;
+
+    if (ping_cnt%10 == 0)
+    {
+        if (is_connected != true)
+        {
+            can_bus_status = CanBusStatus::Unknown;
+        }
+
+        is_connected = false;
+        cmdCanSendType(&cmd_can, PKT_TYPE_PING, NULL, 0);
+    }
 }
 
 void WiznetCanBackend::handlePacket(const QByteArray& data)
 {
-#if 0
-    qDebug() << "Received valid datagram, size =" << data.size();
-    auto allocator = []() {
-        return new canfd_frame; // FIXME: preallocate some buffer for frames
-    };
-
-    QVector<QCanBusFrame> newFrames;
-    auto receiver = [&](canfd_frame* frame, bool) {
-        newFrames.push_back(convert(*frame));
-        delete frame;
-    };
-
-    parseFrames(static_cast<uint16_t>(data.length()),
-                reinterpret_cast<const uint8_t*>(data.constData()), allocator,
-                receiver);
-
-    qDebug() << "Received" << newFrames.size() << "new frames";
-    enqueueReceivedFrames(newFrames);
-#else
     //qDebug() << "Received valid datagram, size =" << data.size();
 
     qbufferWrite(&cmd_can_q, (uint8_t *)data.data(), data.size());
@@ -295,9 +284,33 @@ void WiznetCanBackend::handlePacket(const QByteArray& data)
                 newFrames.push_back(frame);
                 enqueueReceivedFrames(newFrames);
             }
+            if (cmd_can.rx_packet.type == PKT_TYPE_PING)
+            {
+                uint8_t status;
+
+                is_connected = true;
+
+                status = cmd_can.rx_packet.data[0];
+
+                if (status == CAN_ERR_NONE)
+                {
+                    can_bus_status = CanBusStatus::Good;
+                }
+                else if (status & CAN_ERR_BUS_OFF)
+                {
+                    can_bus_status = CanBusStatus::BusOff;
+                }
+                else if (status & CAN_ERR_WARNING)
+                {
+                    can_bus_status = CanBusStatus::Warning;
+                }
+                else
+                {
+                    can_bus_status = CanBusStatus::Error;
+                }
+            }
         }
     }
-#endif
 }
 
 uint32_t WiznetCanBackend::canDriverAvailable(void)
